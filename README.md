@@ -123,20 +123,37 @@ Use formulas to build a live summary:
 
 ## Environment Variables (Postman)
 
-Set these in a Postman environment so requests can reference them:
+### Manual setup (you set these once)
 
 | Variable | Description | Example |
 |---|---|---|
 | `base_url` | API base URL | `http://localhost:8000/api/v1` |
-| `access_token` | JWT access token (set after login) | `eyJ...` |
-| `refresh_token` | JWT refresh token (set after login) | `eyJ...` |
-| `school_id` | UUID of a test school | `e8187163-...` |
-| `student_lrn` | A 12-digit LRN | `120345678901` |
-| `submission_id` | UUID of an enrollment submission | `...` |
-| `section_offering_id` | UUID of a section offering | `...` |
-| `term_id` | UUID of a SchoolAcademicTerm | `...` |
-| `program_id` | UUID of an AcademicProgram (leaf) | `...` |
-| `user_id` | UUID of a target user | `...` |
+| `admin_username` | Superuser username for login | `admin` |
+| `admin_password` | Superuser password for login | `your_password` |
+
+### Auto-populated by scripts (do NOT set manually)
+
+These are populated automatically by post-response scripts as you run requests. The cascading dropdown flow (P3.6) and login scripts fill them in sequence.
+
+| Variable | Populated by | Description |
+|---|---|---|
+| `access_token` | Login (TC-1.1.1) | JWT access token |
+| `refresh_token` | Login (TC-1.1.1) | JWT refresh token |
+| `central_id` | Centrals dropdown (TC-3.6.1 step 1) | First central from response |
+| `region_id` | Regions dropdown (TC-3.6.1 step 2) | First region filtered by central |
+| `division_id` | Divisions dropdown (TC-3.6.1 step 3) | First division filtered by region |
+| `district_id` | Districts dropdown (TC-3.6.1 step 4) | First district filtered by division |
+| `school_id` | Schools dropdown (TC-3.6.1 step 5) | First school filtered by district |
+| `program_id` | Program tree (TC-3.6.1 step 6) | First offered leaf program for selected school |
+| `enrollment_mode` | Enrollment settings (TC-3.6.1 step 7) | Mode for the selected program |
+| `section_offering_id` | Section offerings (TC-3.6.1 step 8) | First section for selected school + program |
+| `submission_id` | Submit BEF (TC-3.6.1 step 9) | Created submission UUID |
+| `term_id` | Enrollment settings response | SchoolAcademicTerm UUID from settings |
+| `user_id` | GET /users/me/ (TC-2.1.x) | Logged-in user's UUID |
+| `student_lrn` | Student onboard response | LRN from created student |
+| `student_id` | Student onboard response | Created student UUID |
+
+> **How it works:** Run the login request first (populates tokens), then run the P3.6 dropdown folder in order (populates geographic chain + school + program + section). Every subsequent test case uses these auto-filled variables. See the automation scripts in the next section for the exact code.
 
 ---
 
@@ -149,12 +166,12 @@ Paste these scripts into the **Scripts** tab of each request to automate token m
 Go to the **collection root** → Scripts → Pre-request. This runs before every request in the collection.
 
 ```javascript
-// Auto-attach Bearer token to authenticated requests
+// Auto-attach Bearer token to authenticated requests.
+// Public endpoints are skipped — they don't need auth.
 const noAuthPaths = [
     '/auth/token',
     '/password/reset/request',
     '/password/reset/confirm',
-    '/enrollment/submissions',  // POST is public
     '/schools/public/',
     '/students/disabilities',
     '/students/modalities',
@@ -166,7 +183,10 @@ const url = pm.request.url.toString();
 const isPublic = noAuthPaths.some(p => url.includes(p));
 const isLogin = url.includes('/auth/token') && !url.includes('/refresh') && !url.includes('/verify') && !url.includes('/blacklist');
 
-if (!isPublic || !isLogin) {
+// Public POST to /enrollment/submissions/ doesn't need auth
+const isPublicSubmission = url.includes('/enrollment/submissions') && pm.request.method === 'POST' && !url.includes('/review');
+
+if (!isPublic && !isLogin && !isPublicSubmission) {
     const token = pm.environment.get('access_token');
     if (token) {
         pm.request.headers.add({
@@ -186,9 +206,15 @@ if (pm.response.code === 200) {
     const body = pm.response.json();
     pm.environment.set('access_token', body.access);
     pm.environment.set('refresh_token', body.refresh);
-    console.log('Tokens saved to environment.');
 
-    // Assertions
+    // Decode JWT payload to extract user info
+    try {
+        const payload = JSON.parse(atob(body.access.split('.')[1]));
+        if (payload.user_id) pm.environment.set('user_id', payload.user_id);
+    } catch (e) { /* non-standard JWT, skip */ }
+
+    console.log('Tokens saved. access_token, refresh_token, user_id populated.');
+
     pm.test('Status is 200', () => pm.response.to.have.status(200));
     pm.test('Has access token', () => pm.expect(body.access).to.be.a('string'));
     pm.test('Has refresh token', () => pm.expect(body.refresh).to.be.a('string'));
@@ -223,7 +249,7 @@ if (pm.response.code === 200) {
 }
 ```
 
-### GET /users/me/ — Profile assertions (TC-2.1.x)
+### GET /users/me/ — Profile assertions + auto-save (TC-2.1.x)
 
 ```javascript
 pm.test('Status is 200', () => pm.response.to.have.status(200));
@@ -239,8 +265,13 @@ pm.test('Has scope object', () => {
     pm.expect(body.scope).to.have.property('group_names');
 });
 
-// Save user_id for later tests
+// Auto-save user_id and school_id from scope
 pm.environment.set('user_id', body.id);
+if (body.scope?.school_id) {
+    pm.environment.set('school_id', body.scope.school_id);
+    console.log('Auto-saved school_id from user scope:', body.scope.school_id);
+}
+console.log('Auto-saved user_id:', body.id);
 ```
 
 ### Geographic Dropdowns — Generic list assertion
@@ -319,7 +350,7 @@ if (pm.response.code === 200) {
 }
 ```
 
-### Student Onboard — Save student IDs (TC-6.1.1, TC-6.2.1)
+### Student Onboard — Auto-save student IDs + LRN (TC-6.1.1, TC-6.2.1)
 
 ```javascript
 if (pm.response.code === 201) {
@@ -331,7 +362,18 @@ if (pm.response.code === 201) {
 
     if (body.student_ids.length > 0) {
         pm.environment.set('student_id', body.student_ids[0]);
+        console.log('Auto-saved student_id:', body.student_ids[0]);
     }
+
+    // Save LRN from the request body for photo upload tests
+    try {
+        const reqBody = JSON.parse(pm.request.body.raw || '{}');
+        const students = reqBody.students || [];
+        if (students.length > 0 && students[0].lrn) {
+            pm.environment.set('student_lrn', students[0].lrn);
+            console.log('Auto-saved student_lrn:', students[0].lrn);
+        }
+    } catch (e) { /* multipart or CSV — LRN in form fields */ }
 }
 ```
 
@@ -470,8 +512,8 @@ POST {{base_url}}/auth/token/
 
 ```json
 {
-  "username": "admin",
-  "password": "your_password"
+  "username": "{{admin_username}}",
+  "password": "{{admin_password}}"
 }
 ```
 
@@ -484,7 +526,7 @@ POST {{base_url}}/auth/token/
 }
 ```
 
-**Post-test script:** Save `access` → `{{access_token}}`, `refresh` → `{{refresh_token}}`.
+**Auto-saved:** `access_token`, `refresh_token` (by the post-response script in the Automation Scripts section).
 
 ---
 
@@ -1101,6 +1143,232 @@ GET {{base_url}}/schools/public/schools/
 ```
 
 **Expected:** `200 OK` — all schools.
+
+---
+
+#### TC-3.5.3: Search by school name
+
+```
+GET {{base_url}}/schools/public/schools/?search=national
+```
+
+**Expected:** `200 OK` — results filtered by name containing "national".
+
+---
+
+#### TC-3.5.4: Search by DepEd school_id
+
+```
+GET {{base_url}}/schools/public/schools/?search=302939
+```
+
+**Expected:** `200 OK` — results filtered by DepEd ID.
+
+---
+
+### P3.6 — Simulating the Enrollment UI: Dropdown-by-Dropdown Walkthrough
+
+> **Context:** On the frontend enrollment form, the user never types a UUID. They pick from dropdowns that cascade — selecting "Central" populates the "Region" dropdown, selecting "Region" populates "Division", and so on until they reach the school, program, and section. This section simulates that exact UI flow using Postman.
+>
+> **No IDs are hardcoded.** Every ID used in later steps comes from a previous response.
+
+#### TC-3.6.1: Full Enrollment Form Dropdown Flow (happy path)
+
+This is the complete user journey from opening the enrollment form to submitting a BEF.
+
+| Step | What the user sees | Postman Request | What to save | Verify |
+|---|---|---|---|---|
+| 1 | **"Select Central" dropdown loads** | `GET {{base_url}}/schools/public/centrals/` | Pick one → save its `id` as `{{central_id}}` | Dropdown shows central names |
+| 2 | **"Select Region" dropdown loads** (filtered by central) | `GET {{base_url}}/schools/public/regions/?central={{central_id}}` | Pick one → save `{{region_id}}` | Only regions under that central appear |
+| 3 | **"Select Division" dropdown loads** (filtered by region) | `GET {{base_url}}/schools/public/divisions/?region={{region_id}}` | Pick one → save `{{division_id}}` | Only divisions under that region |
+| 4 | **"Select District" dropdown loads** (filtered by division) | `GET {{base_url}}/schools/public/districts/?division={{division_id}}` | Pick one → save `{{district_id}}` | Only districts under that division |
+| 5 | **"Select School" dropdown loads** (filtered by district) | `GET {{base_url}}/schools/public/schools/?district={{district_id}}` | Pick one → save `{{school_id}}` | Schools shown with `name`, `school_id`, `is_registered` |
+| 6 | **"Select Program" dropdown loads** (filtered by school) | `GET {{base_url}}/schools/public/school-academic-programs/?school={{school_id}}` | Find a leaf node where `is_offered: true` → save its `id` as `{{program_id}}` | Tree structure; only offered programs appear |
+| 7 | **Form checks enrollment settings** (determines UI behavior) | `GET {{base_url}}/enrollment/settings/?school={{school_id}}` | Note the `enrollment_mode` for your program | If `student_priority` → section picker shown. If `registrar_assign` → no section picker |
+| 8 | **"Select Section" dropdown loads** (if mode = student_priority) | `GET {{base_url}}/enrollment/section-offerings/?school={{school_id}}&program={{program_id}}` | Pick one → save `{{section_offering_id}}` | Sections for that program + school, with `current_students` / `max_students` |
+| 9 | **User fills form and submits** | `POST {{base_url}}/enrollment/submissions/` (body uses `{{school_id}}`, `{{program_id}}`, optionally `{{section_offering_id}}`) | Save `{{submission_id}}` from response | `201 Created`, `status: "pending"` |
+| 10 | **User checks status later** | `GET {{base_url}}/enrollment/submissions/{{submission_id}}/status/` | — | `200 OK`, `status: "pending"` |
+
+**Postman automation — paste as folder-level post-response script for the "Enrollment Dropdowns" folder:**
+
+```javascript
+const body = pm.response.json();
+const url = pm.request.url.toString();
+
+// Geographic cascade — auto-save first result from each level
+if (url.includes('/centrals') && body.results?.length > 0) {
+    pm.environment.set('central_id', body.results[0].id);
+    console.log('Saved central_id:', body.results[0].id, '(' + body.results[0].name + ')');
+}
+if (url.includes('/regions') && !url.includes('/centrals') && body.results?.length > 0) {
+    pm.environment.set('region_id', body.results[0].id);
+    console.log('Saved region_id:', body.results[0].id, '(' + body.results[0].name + ')');
+}
+if (url.includes('/divisions') && body.results?.length > 0) {
+    pm.environment.set('division_id', body.results[0].id);
+    console.log('Saved division_id:', body.results[0].id, '(' + body.results[0].name + ')');
+}
+if (url.includes('/districts') && body.results?.length > 0) {
+    pm.environment.set('district_id', body.results[0].id);
+    console.log('Saved district_id:', body.results[0].id, '(' + body.results[0].name + ')');
+}
+if (url.includes('/schools') && !url.includes('/academic') && body.results?.length > 0) {
+    pm.environment.set('school_id', body.results[0].id);
+    console.log('Saved school_id:', body.results[0].id, '(' + body.results[0].name + ')');
+    pm.test('School has is_registered field', () => {
+        pm.expect(body.results[0]).to.have.property('is_registered');
+    });
+}
+
+// Program tree — find the first leaf with is_offered: true
+if (url.includes('/school-academic-programs')) {
+    function findFirstOfferedLeaf(nodes) {
+        for (const node of nodes) {
+            if (node.is_leaf && node.is_offered) return node;
+            if (node.children?.length > 0) {
+                const found = findFirstOfferedLeaf(node.children);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+    const data = Array.isArray(body) ? body : (body.results || []);
+    const leaf = findFirstOfferedLeaf(data);
+    if (leaf) {
+        pm.environment.set('program_id', leaf.id);
+        console.log('Saved program_id:', leaf.id, '(' + leaf.name + ')');
+    }
+}
+
+// Section offerings — save first
+if (url.includes('/section-offerings') && body.results?.length > 0) {
+    pm.environment.set('section_offering_id', body.results[0].id);
+    console.log('Saved section_offering_id:', body.results[0].id,
+        '(' + body.results[0].section_name + ')');
+}
+
+// Enrollment settings — save enrollment mode + term_id
+if (url.includes('/enrollment/settings')) {
+    const settings = Array.isArray(body) ? body : (body.results || []);
+    if (settings.length > 0) {
+        pm.environment.set('enrollment_mode', settings[0].enrollment_mode);
+        if (settings[0].school_academic_term) {
+            pm.environment.set('term_id', settings[0].school_academic_term);
+            console.log('Saved term_id:', settings[0].school_academic_term);
+        }
+        console.log('Enrollment mode:', settings[0].enrollment_mode);
+    }
+}
+
+// Submission — save ID
+if (url.includes('/submissions') && pm.response.code === 201) {
+    pm.environment.set('submission_id', body.id);
+    console.log('Saved submission_id:', body.id);
+}
+```
+
+> **How to run:** Create a Postman folder called "Enrollment Dropdowns", paste the script above as its post-response script, then add requests 1-10 in order. Hit "Run folder" — each request auto-populates the variables for the next one. Zero manual UUID copying.
+
+---
+
+#### TC-3.6.2: User picks a different school — dropdowns reset
+
+> Simulates the user changing their school selection mid-form, which should re-fetch programs and sections.
+
+| Step | What the user does | Postman Request | Verify |
+|---|---|---|---|
+| 1 | Complete steps 1-5 above for School A | (same as TC-3.6.1 steps 1-5) | `{{school_id}}` = School A |
+| 2 | User changes district selection | `GET .../districts/?division={{division_id}}` | Pick a *different* district → update `{{district_id}}` |
+| 3 | School dropdown reloads | `GET .../schools/?district={{district_id}}` | Different schools appear → update `{{school_id}}` |
+| 4 | Program dropdown reloads | `GET .../school-academic-programs/?school={{school_id}}` | Programs for new school (may be different) |
+| 5 | Section dropdown reloads | `GET .../section-offerings/?school={{school_id}}&program={{program_id}}` | Sections for new school |
+
+---
+
+#### TC-3.6.3: Dropdown shows empty — no children at a level
+
+> Simulates the user selecting a geographic level that has no children. The next dropdown should be empty, blocking further selection.
+
+| Step | Scenario | Postman Request | Expected UI behavior |
+|---|---|---|---|
+| 1 | Central has no regions | `GET .../regions/?central={{central_id}}` | `results: []` — Region dropdown is empty/disabled |
+| 2 | Region has no divisions | `GET .../divisions/?region={{region_id}}` | `results: []` — Division dropdown is empty/disabled |
+| 3 | District has no schools | `GET .../schools/?district={{district_id}}` | `results: []` — School dropdown is empty/disabled |
+| 4 | School has no offered programs | `GET .../school-academic-programs/?school={{school_id}}` | `[]` — Program dropdown is empty/disabled |
+| 5 | School has no enrollment settings | `GET .../enrollment/settings/?school={{school_id}}` | `404` — Form shows "Enrollment not configured" |
+| 6 | Enrollment window closed | `GET .../section-offerings/?school={{school_id}}` | `400` — Form shows "Enrollment is not open" |
+
+---
+
+#### TC-3.6.4: User searches within a dropdown
+
+> Simulates the user typing in a search/filter box within a dropdown.
+
+| Step | What the user types | Postman Request | Verify |
+|---|---|---|---|
+| 1 | Types "national" in school search | `GET .../schools/?district={{district_id}}&search=national` | Results filtered by name |
+| 2 | Types DepEd ID "302939" in school search | `GET .../schools/?district={{district_id}}&search=302939` | Exact school matched |
+| 3 | Types partial name in region search | `GET .../regions/?central={{central_id}}&search=IV` | Matching regions shown |
+| 4 | Types gibberish | `GET .../schools/?district={{district_id}}&search=zzzzzzzzz` | `results: []` |
+
+---
+
+#### TC-3.6.5: Section picker shows capacity info
+
+> The enrollment form shows section capacity so the user can make an informed choice.
+
+```
+GET {{base_url}}/enrollment/section-offerings/?school={{school_id}}&program={{program_id}}
+```
+
+**Verify each result has:**
+
+| Field | Description | Example |
+|---|---|---|
+| `section_name` | Display name for the user | "Section A" |
+| `program_name` | Grade level | "Grade 7" |
+| `max_students` | Capacity (advisory) | 40 |
+| `current_students` | Currently enrolled | 12 |
+
+The UI can display this as: **"Section A (12/40)"**
+
+---
+
+#### TC-3.6.6: Section preferences (student_priority mode)
+
+> When `enrollment_mode=student_priority`, the user can rank their section preferences (up to `max_section_choices`).
+
+**Pre-condition:** Enrollment settings for this school/program have `enrollment_mode: "student_priority"`, `max_section_choices: 3`.
+
+| Step | What the user does | Postman Request | Verify |
+|---|---|---|---|
+| 1 | Loads section offerings | `GET .../section-offerings/?school={{school_id}}&program={{program_id}}` | Save IDs of 2 sections as `{{pref_1}}`, `{{pref_2}}` |
+| 2 | Submits BEF with ranked preferences | `POST .../enrollment/submissions/` with `"section_preferences": ["{{pref_1}}", "{{pref_2}}"]` | `201`, `section_preferences` populated in response |
+| 3 | Submits with too many preferences | Send 4 prefs when `max_section_choices: 3` | `400` — "Too many section preferences (max 3)." |
+| 4 | Submits with duplicate preference | `["{{pref_1}}", "{{pref_1}}"]` | `400` — "Duplicate section preferences are not allowed." |
+
+---
+
+#### TC-3.6.7: Registrar review — same dropdown flow on admin side
+
+> After submission, the registrar reviews it and must pick a section offering to assign the student.
+
+| Step | What the registrar sees | Postman Request | Verify |
+|---|---|---|---|
+| 1 | Registrar lists pending submissions | `GET {{base_url}}/enrollment/submissions/?status=pending` (auth required) | List of pending submissions |
+| 2 | Registrar opens submission detail | `GET {{base_url}}/enrollment/submissions/{{submission_id}}/` | Full student_data + section_preference_details |
+| 3 | Registrar loads section offerings to pick from | `GET {{base_url}}/enrollment/section-offerings/?school={{school_id}}&program={{program_id}}` | Available sections (same dropdown the student saw) |
+| 4 | Registrar admits with chosen section | `PATCH {{base_url}}/enrollment/submissions/{{submission_id}}/review/` with `{"status":"admitted","section_offering":"{{section_offering_id}}"}` | `200`, `status=admitted`, `admitted_student` populated |
+
+---
+
+### P3.7 — Pagination Within Dropdowns
+
+| Step | Request | Expected |
+|---|---|---|
+| 1 | `GET .../schools/?district={{district_id}}&page=1&page_size=2` | `count` shows total, `results` has max 2, `next` link |
+| 2 | `GET .../schools/?district={{district_id}}&page=2&page_size=2` | Next page of results |
+| 3 | `GET .../regions/?central={{central_id}}&page=999` | `200 OK`, empty `results` (past last page) |
 
 ---
 
@@ -2123,63 +2391,78 @@ GET {{base_url}}/realtime/telegram/webhook/{{school_id}}/
 
 ## P11. End-to-End Flows
 
-### E1. Full Enrollment Cycle
+> **Important:** These flows use variables populated by earlier dropdown steps. Do NOT hardcode UUIDs. Follow the dropdown walkthrough in P3.6 first to populate `{{school_id}}`, `{{program_id}}`, `{{section_offering_id}}`, etc.
 
-| Step | Action | Verify |
-|---|---|---|
-| 1 | `POST /enrollment/submissions/` — submit BEF | `201`, status=pending |
-| 2 | `GET /enrollment/submissions/` — list (as registrar) | Submission appears |
-| 3 | `GET /enrollment/submissions/{id}/` — detail | Full student_data visible |
-| 4 | `PATCH /enrollment/submissions/{id}/review/` — admit | `200`, status=admitted |
-| 5 | `GET /enrollment/submissions/{id}/status/` — public check | status=admitted |
-| 6 | `POST /students/onboard/batch-photos/` — upload photo | matched=1 |
-| 7 | Verify in DB/admin: StudentBridgeSync status=pending | Bridge waiting for sync |
+### E1. Full Enrollment Cycle (From Dropdown to Admission)
+
+This is the complete story: a student fills the enrollment form (picking from dropdowns), submits it, a registrar reviews it, and the student gets admitted.
+
+| Step | Actor | Action | Postman Request | Verify |
+|---|---|---|---|---|
+| 1 | Student | Opens enrollment form — geographic dropdowns load | Run TC-3.6.1 steps 1-5 | `{{central_id}}` through `{{school_id}}` populated |
+| 2 | Student | Selects program from tree | `GET .../school-academic-programs/?school={{school_id}}` | `{{program_id}}` = offered leaf node |
+| 3 | Student | Form checks enrollment mode | `GET .../enrollment/settings/?school={{school_id}}` | Note `enrollment_mode` |
+| 4 | Student | Picks section preference (if student_priority) | `GET .../section-offerings/?school={{school_id}}&program={{program_id}}` | `{{section_offering_id}}` saved |
+| 5 | Student | Submits enrollment form | `POST .../enrollment/submissions/` with `{{school_id}}`, `{{program_id}}`, student_data, section_preferences | `201`, `{{submission_id}}` saved, `status=pending` |
+| 6 | Student | Checks submission status | `GET .../enrollment/submissions/{{submission_id}}/status/` | `status=pending` |
+| 7 | Registrar | Logs in | `POST .../auth/token/` | `{{access_token}}` updated |
+| 8 | Registrar | Lists pending submissions | `GET .../enrollment/submissions/?status=pending` | Submission from step 5 appears |
+| 9 | Registrar | Opens submission detail | `GET .../enrollment/submissions/{{submission_id}}/` | Full student_data visible, section_preference_details shown |
+| 10 | Registrar | Loads section offerings to assign | `GET .../section-offerings/?school={{school_id}}&program={{program_id}}` | Sections available (registrar picks one) |
+| 11 | Registrar | Admits student | `PATCH .../enrollment/submissions/{{submission_id}}/review/` with `{"status":"admitted","section_offering":"{{section_offering_id}}","remarks":"Approved"}` | `200`, `status=admitted`, `admitted_student` populated |
+| 12 | Student | Checks status again | `GET .../enrollment/submissions/{{submission_id}}/status/` | `status=admitted` |
+| 13 | Registrar | Uploads student photo | `POST .../students/onboard/batch-photos/` with LRN-named photo | `matched=1` |
+| 14 | — | Verify bridge sync queued | Check admin: StudentBridgeSync `status=pending` | Bridge waiting for sync |
 
 ---
 
-### E2. Student Onboarding via CSV
+### E2. Student Onboarding via CSV (Registrar Flow)
 
-| Step | Action | Verify |
-|---|---|---|
-| 1 | `POST /students/onboard/batch/` — upload CSV | `201`, created_count matches rows |
-| 2 | Check admin: Students created with auto-generated usernames | Usernames follow `first.last.lrn` pattern |
-| 3 | `POST /students/onboard/batch-photos/` — upload photos | matched count > 0 |
-| 4 | Check admin: User.profile_image set | Photos stored in uploads/profile_pictures/ |
-| 5 | Check admin: StudentBridgeSync rows exist, status=pending | Ready for bridge sync |
+| Step | Actor | Action | Postman Request | Verify |
+|---|---|---|---|---|
+| 1 | Registrar | Logs in | `POST .../auth/token/` | Tokens saved |
+| 2 | Registrar | Selects school (from dropdown) | Run TC-3.6.1 steps 1-5 | `{{school_id}}` populated |
+| 3 | Registrar | Uploads CSV of students | `POST .../students/onboard/batch/` with `school_id={{school_id}}` + CSV file | `201`, `created_count` matches rows |
+| 4 | Registrar | Verifies in admin | Check Students list in `/admin/` | Usernames follow `first.last.lrn` pattern |
+| 5 | Registrar | Uploads photos (LRN-named files) | `POST .../students/onboard/batch-photos/` | `matched` count > 0 |
+| 6 | — | Verify photos saved | Check admin: User.profile_image set | Photos stored in uploads/ |
+| 7 | — | Verify bridge sync rows | Check admin: StudentBridgeSync rows, `status=pending` | Ready for bridge sync |
 
 ---
 
 ### E3. Password Reset
 
-| Step | Action | Verify |
-|---|---|---|
-| 1 | `POST /users/password/reset/request/` with valid email | `200`, check console/email for uid+token |
-| 2 | `POST /users/password/reset/confirm/` with uid+token+new_password | `200`, "Password has been reset" |
-| 3 | `POST /auth/token/` — login with NEW password | `200`, tokens returned |
-| 4 | `POST /auth/token/` — login with OLD password | `401`, fails |
+| Step | Actor | Action | Postman Request | Verify |
+|---|---|---|---|---|
+| 1 | User | Requests password reset | `POST .../users/password/reset/request/` with email | `200`, generic message (check console for uid+token) |
+| 2 | User | Confirms reset | `POST .../users/password/reset/confirm/` with uid+token+new_password | `200`, "Password has been reset" |
+| 3 | User | Logs in with NEW password | `POST .../auth/token/` | `200`, tokens returned |
+| 4 | User | Tries OLD password | `POST .../auth/token/` | `401`, fails |
 
 ---
 
 ### E4. Academic Year Rollover
 
-| Step | Action | Verify |
-|---|---|---|
-| 1 | `POST /enrollment/rollover/` with `dry_run: true` | `200`, preview with sections plan |
-| 2 | Review `sections.to_create` and `sections.needs_attention` | Lifecycle rules applied correctly |
-| 3 | `POST /enrollment/rollover/` with `dry_run: false` | `200`, `term_created.id` present |
-| 4 | Check admin: SchoolAcademicTerm created | Dates match request |
-| 5 | Check admin: Sub-terms created as children | Linked to parent term |
-| 6 | Check admin: SectionOfferings created | Programs match plan |
+| Step | Actor | Action | Postman Request | Verify |
+|---|---|---|---|---|
+| 1 | Admin | Logs in | `POST .../auth/token/` | Tokens saved |
+| 2 | Admin | Selects school (from dropdown) | Run TC-3.6.1 steps 1-5 | `{{school_id}}` populated |
+| 3 | Admin | Dry run preview | `POST .../enrollment/rollover/` with `dry_run: true` | `200`, preview: `term_preview`, `sections.to_create`, `sections.needs_attention` |
+| 4 | Admin | Reviews section plan | Inspect `sections.carried_over` and `sections.needs_attention` | Lifecycle rules applied correctly |
+| 5 | Admin | Executes rollover | Same payload with `dry_run: false` | `200`, `term_created.id` present |
+| 6 | Admin | Verifies in admin | Check SchoolAcademicTerm in `/admin/` | New term created with correct dates |
+| 7 | Admin | Verifies sub-terms | Check SchoolAcademicTerm children | Linked to parent, dates within range |
+| 8 | Admin | Verifies section offerings | Check SectionOffering list in admin | Programs match plan from step 3 |
 
 ---
 
 ### E5. Login with Email
 
-| Step | Action | Verify |
-|---|---|---|
-| 1 | Set email on a user via admin (e.g. `testuser@example.com`) | Email saved |
-| 2 | `POST /auth/token/` with `{"username": "testuser@example.com", "password": "..."}` | `200`, tokens returned |
-| 3 | `GET /users/me/` with the token | Correct user returned |
+| Step | Actor | Action | Postman Request | Verify |
+|---|---|---|---|---|
+| 1 | Admin | Sets email on a user via `/admin/` | In admin: edit user → set email `testuser@example.com` | Email saved |
+| 2 | User | Logs in with email | `POST .../auth/token/` with `{"username":"testuser@example.com","password":"..."}` | `200`, tokens returned |
+| 3 | User | Checks profile | `GET .../users/me/` | Correct user returned |
 
 ---
 
